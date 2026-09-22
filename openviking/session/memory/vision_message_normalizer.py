@@ -2,11 +2,16 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Normalize image messages into extraction-friendly text messages."""
 
+import base64
+import logging
 from collections.abc import Callable
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from openviking.message import Message
 from openviking.message.part import ImagePart, TextPart
+
+logger = logging.getLogger(__name__)
 
 IMAGE_DESCRIPTION_PROMPT = (
     "Describe this image for later memory extraction. Focus on durable, user-relevant "
@@ -14,13 +19,61 @@ IMAGE_DESCRIPTION_PROMPT = (
     "facts that may matter in future conversations. Return only the description."
 )
 
+# Sources the VLM can fetch or already holds as bytes. Anything else is a
+# writer-side filesystem path that must be inlined before it leaves this host.
+_REMOTE_IMAGE_PREFIXES = ("http://", "https://", "data:")
+
+# Mirrors the extension table in the VLM backends' ``_prepare_image``; unknown
+# extensions fall back to PNG exactly as they do there.
+_IMAGE_MIME_BY_SUFFIX = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
 
 def message_has_image_part(message: Message) -> bool:
     return any(isinstance(part, ImagePart) for part in getattr(message, "parts", []))
 
 
-def image_part_to_openai_content(part: ImagePart) -> Dict[str, Any]:
-    image_url: Dict[str, Any] = {"url": part.url}
+def _local_image_to_data_uri(url: str) -> Optional[str]:
+    """Read a local image file and inline it as a base64 data URI.
+
+    Returns ``None`` when the file cannot be read, which is the expected case
+    when the writer that captured the path runs on a different host from this
+    server: there are no bytes to send, and emitting the path verbatim would
+    only reach the model as an unusable ``image_url`` target.
+    """
+    try:
+        data = Path(url).read_bytes()
+    except OSError as exc:
+        logger.warning("Skipping unreadable image path %s: %s", url, exc)
+        return None
+    mime_type = _IMAGE_MIME_BY_SUFFIX.get(Path(url).suffix.lower(), "image/png")
+    encoded = base64.b64encode(data).decode("utf-8")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def image_part_to_openai_content(part: ImagePart) -> Optional[Dict[str, Any]]:
+    """Build an OpenAI image content block for an ``ImagePart``.
+
+    ``http(s)`` and ``data:`` sources pass through unchanged. Any other value is
+    treated as a local path and inlined as a data URI, because the VLM is called
+    with ``messages=`` and its own ``images=`` conversion never runs on this
+    path. Returns ``None`` when a local path cannot be read.
+    """
+    if part.url.startswith(_REMOTE_IMAGE_PREFIXES):
+        image_url: Dict[str, Any] = {"url": part.url}
+        if part.detail is not None:
+            image_url["detail"] = part.detail
+        return {"type": "image_url", "image_url": image_url}
+
+    data_uri = _local_image_to_data_uri(part.url)
+    if data_uri is None:
+        return None
+    image_url = {"url": data_uri}
     if part.detail is not None:
         image_url["detail"] = part.detail
     return {"type": "image_url", "image_url": image_url}
@@ -32,7 +85,9 @@ def build_vision_description_messages(message: Message) -> List[Dict[str, Any]]:
         if isinstance(part, TextPart) and part.text:
             content.append({"type": "text", "text": part.text})
         elif isinstance(part, ImagePart):
-            content.append(image_part_to_openai_content(part))
+            block = image_part_to_openai_content(part)
+            if block is not None:
+                content.append(block)
     return [{"role": "user", "content": content}]
 
 

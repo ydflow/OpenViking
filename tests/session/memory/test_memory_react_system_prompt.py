@@ -4,9 +4,14 @@
 Test that provider instruction correctly instructs LLM.
 """
 
+import base64
+
 from openviking.message import ImagePart, Message, TextPart, ToolPart
 from openviking.session.memory.session_extract_context_provider import SessionExtractContextProvider
-from openviking.session.memory.vision_message_normalizer import IMAGE_DESCRIPTION_PROMPT
+from openviking.session.memory.vision_message_normalizer import (
+    IMAGE_DESCRIPTION_PROMPT,
+    image_part_to_openai_content,
+)
 
 
 class TestProviderInstruction:
@@ -362,6 +367,114 @@ class TestSessionConversationToolFiltering:
         assert len(messages) == 1
         assert any(isinstance(part, ImagePart) for part in messages[0].parts)
         assert provider.messages is not messages
+
+
+class TestImagePartUrlNormalization:
+    """A local ``ImagePart.url`` must reach the VLM as a data URI, not a raw path.
+
+    ``get_vision_completion_async(messages=...)`` takes the branch that leaves
+    image content untouched, so the normalizer is the only place that can turn a
+    writer-side filesystem path into bytes the model can actually see.
+    """
+
+    PNG_BYTES = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+    )
+
+    def _write(self, tmp_path, name, data):
+        path = tmp_path / name
+        path.write_bytes(data)
+        return str(path)
+
+    async def test_local_png_path_is_sent_as_data_uri(self, tmp_path):
+        path = self._write(tmp_path, "sample.png", self.PNG_BYTES)
+
+        content = image_part_to_openai_content(ImagePart(url=path))
+
+        assert content == {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/png;base64,{base64.b64encode(self.PNG_BYTES).decode()}"
+            },
+        }
+        assert path not in content["image_url"]["url"]
+
+    async def test_local_jpeg_path_uses_jpeg_mime(self, tmp_path):
+        path = self._write(tmp_path, "sample.jpg", b"\xff\xd8\xff\xe0" + b"0" * 32)
+
+        content = image_part_to_openai_content(ImagePart(url=path))
+
+        assert content["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+    async def test_unknown_extension_falls_back_to_png_mime(self, tmp_path):
+        path = self._write(tmp_path, "sample.xyz", self.PNG_BYTES)
+
+        content = image_part_to_openai_content(ImagePart(url=path))
+
+        assert content["image_url"]["url"].startswith("data:image/png;base64,")
+
+    async def test_https_url_passes_through_with_detail(self):
+        content = image_part_to_openai_content(
+            ImagePart(url="https://example.com/image.png", detail="auto")
+        )
+
+        assert content == {
+            "type": "image_url",
+            "image_url": {"url": "https://example.com/image.png", "detail": "auto"},
+        }
+
+    async def test_data_uri_passes_through_unchanged(self):
+        data_uri = "data:image/png;base64,iVBORw0KGgo="
+
+        content = image_part_to_openai_content(ImagePart(url=data_uri))
+
+        assert content == {"type": "image_url", "image_url": {"url": data_uri}}
+
+    async def test_unreadable_local_path_drops_the_image_part(self, tmp_path, caplog):
+        missing = str(tmp_path / "does-not-exist.png")
+
+        content = image_part_to_openai_content(ImagePart(url=missing))
+
+        assert content is None
+        assert "does-not-exist.png" in caplog.text
+
+    async def test_unreadable_local_path_keeps_text_and_skips_image(self, tmp_path):
+        """The text part survives; only the unusable image part is dropped."""
+        missing = str(tmp_path / "does-not-exist.png")
+
+        captured = {}
+
+        class FakeVisionVLM:
+            async def get_vision_completion_async(self, **kwargs):
+                captured["messages"] = kwargs.get("messages")
+                return "A description."
+
+        messages = [
+            Message(
+                id="m1",
+                role="user",
+                parts=[TextPart("Please remember this image."), ImagePart(url=missing)],
+            )
+        ]
+        provider = SessionExtractContextProvider(messages=messages)
+        provider._vision_vlm = FakeVisionVLM()
+
+        await provider.prepare_extraction_messages()
+        prompt_message = provider._build_conversation_message()
+
+        assert "Please remember this image." in prompt_message["content"]
+        assert "A description." in prompt_message["content"]
+        assert missing not in prompt_message["content"]
+        # The unusable image part never reaches the VLM request.
+        assert captured["messages"] == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": IMAGE_DESCRIPTION_PROMPT},
+                    {"type": "text", "text": "Please remember this image."},
+                ],
+            }
+        ]
 
 
 def test_session_provider_empty_messages_still_uses_environment_fallback(monkeypatch):
