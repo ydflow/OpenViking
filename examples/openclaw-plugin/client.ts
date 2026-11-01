@@ -55,6 +55,8 @@ export type SearchContextOptions = {
   peerScope?: "actor" | "all";
   actorPeerId?: string;
   requestTimeoutMs?: number;
+  /** Event time-decay window (e.g. "7d") sent as events_time_decay_protection; empty leaves decay off. */
+  eventsDecayProtection?: string;
 };
 
 export type FsListEntry = string | Record<string, unknown>;
@@ -503,6 +505,7 @@ export class OpenVikingClient {
       recallDedupTurns: options.dedupTurns,
       recallPeerScope: options.peerScope,
       recallContextTimeoutMs: options.requestTimeoutMs,
+      recallEventsDecayProtection: options.eventsDecayProtection,
       timeoutMs: this.timeoutMs,
     };
     const body = {
